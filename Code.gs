@@ -46,6 +46,7 @@ function onOpen() {
     .addItem('▶ Run Query', 'runQuery')
     .addItem('🔄 Fetch Last Result', 'fetchLastResult')
     .addItem('🔍 Diagnose Scan Limit', 'diagnose')
+    .addItem('📏 Probe Bytes Per Table', 'probeTables')
     .addToUi();
 }
 
@@ -376,7 +377,10 @@ function diagnose() {
         ClientRequestToken: Utilities.getUuid()
       }).QueryExecutionId;
       const st = pollExecution(id, 60);
-      if (st !== 'SUCCEEDED') { rows.push([t, 'Query ' + st]); return; }
+      if (st !== 'SUCCEEDED') {
+        const why = (athenaCall('GetQueryExecution', { QueryExecutionId: id }).QueryExecution.Status || {}).StateChangeReason;
+        rows.push([t, 'Query ' + st + ': ' + why]); return;
+      }
       const res = athenaCall('GetQueryResults', { QueryExecutionId: id, MaxResults: 1000 });
       const ddl = res.ResultSet.Rows.map(r => (r.Data[0] || {}).VarCharValue || '').join('\n');
       rows.push([t, ddl]);
@@ -386,4 +390,45 @@ function diagnose() {
   sh.getRange('A1:B1').setFontWeight('bold');
   sh.setColumnWidth(1, 300).setColumnWidth(2, 700);
   ss.toast('Diagnose written to "Diagnose" sheet', 'Insurance FMS', 8);
+}
+
+// ============================================================
+//  PROBE: bytes each table costs for the columns the query reads
+//  (each probe is capped at the workgroup limit; "50.00 GB / CANCELLED"
+//   means that table alone needs at least that much)
+// ============================================================
+function probeTables() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = readConfig();
+  const probes = [
+    ['finserv_insurance_fms_query (filtered, as in query)',
+     "select count(*) from fact_tables.finserv_insurance_fms_query where insurance_expiry_date is not null " +
+     "and date(from_unixtime((insurance_expiry_date + 19800000)/1000)) between date('" + cfg.startDate + "') and date('" + cfg.endDate + "')"],
+    ['fleetowner (id, phone_no)',
+     'select count(id), count(phone_no) from supply_team.supply_team_blackbuck_fleetApp_fleetowner'],
+    ['truck_owner_request (id, truck_id, kyc_status_v2, truck_owner_id, __ts_ms)',
+     'select count(id), count(truck_id), count(kyc_status_v2), count(truck_owner_id), count(__ts_ms) from supply_team.supply_team_blackbuck_truck_owner_request'],
+    ['document (id, document_no, document_type, entity_id, entity_type, status, version)',
+     'select count(id), count(document_no), count(document_type), count(entity_id), count(entity_type), count(status), count(version) from supply.supply_blackbuck_document']
+  ];
+  let sh = ss.getSheetByName('Probe') || ss.insertSheet('Probe');
+  sh.clear();
+  const rows = [['Table / columns', 'State', 'GB scanned', 'Note']];
+  probes.forEach(p => {
+    try {
+      const id = athenaCall('StartQueryExecution', {
+        QueryString: p[1], WorkGroup: WORK_GROUP, QueryExecutionContext: { Database: SCHEMA },
+        ClientRequestToken: Utilities.getUuid()
+      }).QueryExecutionId;
+      const st = pollExecution(id, 150);
+      const qe = athenaCall('GetQueryExecution', { QueryExecutionId: id }).QueryExecution;
+      const gb = ((qe.Statistics || {}).DataScannedInBytes || 0) / 1073741824;
+      rows.push([p[0], st, gb.toFixed(2), (qe.Status || {}).StateChangeReason || '']);
+    } catch (e) { rows.push([p[0], 'ERROR', '', e.message]); }
+    sh.getRange(1, 1, rows.length, 4).setValues(rows);
+    SpreadsheetApp.flush();
+  });
+  sh.getRange('A1:D1').setFontWeight('bold');
+  sh.setColumnWidth(1, 520).setColumnWidth(4, 400);
+  ss.toast('Probe written to "Probe" sheet', 'Insurance FMS', 8);
 }
