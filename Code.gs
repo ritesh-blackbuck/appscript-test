@@ -9,9 +9,9 @@
  * "Bytes scanned limit was exceeded" means the workgroup's per-query data
  * limit (analyst-adhoc-executions) cancelled the query. Changes in this
  * version to scan less data:
- *   - the state-prefix and date filters are applied to the first table
- *     scanned, and every other table is semi-joined to the surviving
- *     truck_ids / owner ids instead of being scanned for all rows
+ *   - Athena re-runs a CTE at every reference, so the wide base table is
+ *     now read once; other tables key off a narrow `ids` CTE
+ *   - the other tables are semi-joined to the surviving ids
  *   - redundant GROUP BY / DISTINCT passes removed
  *   - on failure the script reports bytes scanned, so you can see how
  *     close a narrower date range / fewer states gets you to the limit
@@ -108,13 +108,12 @@ function buildQuery(cfg) {
     : '1=1';
   const limitClause = cfg.limit > 0 ? 'limit ' + cfg.limit : '';
 
+  // NOTE: Athena re-executes a CTE at every reference, so the wide table
+  // (finserv_insurance_fms_query, ~20 columns) is read exactly once, in the
+  // final SELECT. Everything else keys off the narrow `ids` CTE.
   return `with
-base as (
-  select fleet_owner_id, fo_name, truck_no, truck_id, registration_date, manufacturer, body_type, gross_weight,
-         unladen_weight, wheel_base, model, vehicle_class, vehicle_category, cubic_capacity,
-         insurance_name, insurance_policy_number,
-         date(from_unixtime((insurance_expiry_date + 19800000)/1000)) as insurance_expiry_date,
-         financier, last_updated_on as last_fetched_on, latitude, longitude
+ids as (
+  select truck_id, fleet_owner_id
   from fact_tables.finserv_insurance_fms_query
   where insurance_expiry_date is not null
     and date(from_unixtime((insurance_expiry_date + 19800000)/1000)) between date('${cfg.startDate}') and date('${cfg.endDate}')
@@ -123,13 +122,8 @@ base as (
 fleet_phone as (
   select id, phone_no
   from supply_team.supply_team_blackbuck_fleetApp_fleetowner
-  where id in (select fleet_owner_id from base)
+  where id in (select fleet_owner_id from ids)
   group by 1, 2
-),
-final_final_ritesh_data as (
-  select a.*, b.phone_no
-  from base a
-  left join fleet_phone b on a.fleet_owner_id = b.id
 ),
 tto_latest as (
   select id,
@@ -143,12 +137,7 @@ tto_kyc as (
   select distinct truck_id, truck_owner_id, kyc_status
   from tto_latest
   where kyc_status in ('INSTANT_KYC_APPROVED', 'APPROVED')
-    and truck_id in (select truck_id from base)
-),
-final_data_ritesh_master as (
-  select a.*, b.kyc_status, b.truck_owner_id
-  from final_final_ritesh_data a
-  join tto_kyc b on a.truck_id = b.truck_id
+    and truck_id in (select truck_id from ids)
 ),
 documents as (
   select id,
@@ -163,14 +152,29 @@ documents as (
 ),
 docs_ok as (
   select * from documents
-  where entity_id in (select truck_owner_id from final_data_ritesh_master)
+  where entity_id in (select truck_owner_id from tto_kyc)
 )
-select distinct a.*, b.*, c.document_no as aadhar_no, c.document_type, c.status as aadhar_status
-from final_data_ritesh_master a
-left join (select * from docs_ok where document_type = 'PAN_CARD') b
-  on a.truck_owner_id = b.entity_id
-left join (select * from docs_ok where document_type = 'ADHAAR_CARD') c
-  on a.truck_owner_id = c.entity_id
+select distinct
+  m.fleet_owner_id, m.fo_name, m.truck_no, m.truck_id, m.registration_date, m.manufacturer, m.body_type, m.gross_weight,
+  m.unladen_weight, m.wheel_base, m.model, m.vehicle_class, m.vehicle_category, m.cubic_capacity,
+  m.insurance_name, m.insurance_policy_number, m.insurance_expiry_date, m.financier, m.last_fetched_on,
+  p.phone_no, m.latitude, m.longitude, k.kyc_status, k.truck_owner_id,
+  b.*, c.document_no as aadhar_no, c.document_type, c.status as aadhar_status
+from (
+  select fleet_owner_id, fo_name, truck_no, truck_id, registration_date, manufacturer, body_type, gross_weight,
+         unladen_weight, wheel_base, model, vehicle_class, vehicle_category, cubic_capacity,
+         insurance_name, insurance_policy_number,
+         date(from_unixtime((insurance_expiry_date + 19800000)/1000)) as insurance_expiry_date,
+         financier, last_updated_on as last_fetched_on, latitude, longitude
+  from fact_tables.finserv_insurance_fms_query
+  where insurance_expiry_date is not null
+    and date(from_unixtime((insurance_expiry_date + 19800000)/1000)) between date('${cfg.startDate}') and date('${cfg.endDate}')
+    and ${prefixFilter}
+) m
+left join fleet_phone p on m.fleet_owner_id = p.id
+join tto_kyc k on m.truck_id = k.truck_id
+left join (select * from docs_ok where document_type = 'PAN_CARD') b on k.truck_owner_id = b.entity_id
+left join (select * from docs_ok where document_type = 'ADHAAR_CARD') c on k.truck_owner_id = c.entity_id
 ${limitClause}`;
 }
 
