@@ -7,7 +7,7 @@
  *  2. Reload the Sheet → menu "🚛 Insurance FMS" → "Setup Config Sheet" → "Run Query".
  *
  * "Bytes scanned limit was exceeded" means the workgroup's per-query data
- * limit (analyst-adhoc-executions) cancelled the query. Changes in this
+ * limit (see WORK_GROUP) cancelled the query. Changes in this
  * version to scan less data:
  *   - Athena re-runs a CTE at every reference, so the wide base table is
  *     now read once; other tables key off a narrow `ids` CTE
@@ -23,7 +23,7 @@
 const AWS_REGION      = 'ap-south-1';
 const ATHENA_HOST     = 'athena.' + AWS_REGION + '.amazonaws.com';
 const ATHENA_ENDPOINT = 'https://' + ATHENA_HOST + '/';
-const WORK_GROUP      = 'analyst-adhoc-executions';
+const WORK_GROUP      = 'analyst-adhoc-executions-highlimit';
 const SCHEMA          = 'fact_tables';
 
 const CONFIG_SHEET  = 'Config';
