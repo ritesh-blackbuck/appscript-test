@@ -45,6 +45,7 @@ function onOpen() {
     .addItem('1️⃣ Setup Config Sheet', 'setupConfigSheet')
     .addItem('▶ Run Query', 'runQuery')
     .addItem('🔄 Fetch Last Result', 'fetchLastResult')
+    .addItem('🔍 Diagnose Scan Limit', 'diagnose')
     .addToUi();
 }
 
@@ -347,4 +348,42 @@ function hmacBytes(message, keyBytes) {
 }
 function bytesToHex(bytes) {
   return bytes.map(b => ((b < 0 ? b + 256 : b).toString(16)).padStart(2, '0')).join('');
+}
+
+// ============================================================
+//  DIAGNOSE: workgroup limit + table partitioning (scans 0 bytes)
+// ============================================================
+function diagnose() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName('Diagnose') || ss.insertSheet('Diagnose');
+  sh.clear();
+  const rows = [['Item', 'Detail']];
+
+  const wg = athenaCall('GetWorkGroup', { WorkGroup: WORK_GROUP }).WorkGroup.Configuration || {};
+  const cutoff = wg.BytesScannedCutoffPerQuery;
+  rows.push(['Per-query bytes limit', cutoff ? (cutoff / 1073741824).toFixed(2) + ' GB' : 'none reported']);
+
+  const tables = [
+    'fact_tables.finserv_insurance_fms_query',
+    'supply_team.supply_team_blackbuck_fleetApp_fleetowner',
+    'supply_team.supply_team_blackbuck_truck_owner_request',
+    'supply.supply_blackbuck_document'
+  ];
+  tables.forEach(t => {
+    try {
+      const id = athenaCall('StartQueryExecution', {
+        QueryString: 'SHOW CREATE TABLE ' + t, WorkGroup: WORK_GROUP,
+        ClientRequestToken: Utilities.getUuid()
+      }).QueryExecutionId;
+      const st = pollExecution(id, 60);
+      if (st !== 'SUCCEEDED') { rows.push([t, 'Query ' + st]); return; }
+      const res = athenaCall('GetQueryResults', { QueryExecutionId: id, MaxResults: 1000 });
+      const ddl = res.ResultSet.Rows.map(r => (r.Data[0] || {}).VarCharValue || '').join('\n');
+      rows.push([t, ddl]);
+    } catch (e) { rows.push([t, 'Error: ' + e.message]); }
+  });
+  sh.getRange(1, 1, rows.length, 2).setValues(rows);
+  sh.getRange('A1:B1').setFontWeight('bold');
+  sh.setColumnWidth(1, 300).setColumnWidth(2, 700);
+  ss.toast('Diagnose written to "Diagnose" sheet', 'Insurance FMS', 8);
 }
