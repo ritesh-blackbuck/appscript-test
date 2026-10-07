@@ -47,6 +47,7 @@ function onOpen() {
     .addItem('🔄 Fetch Last Result', 'fetchLastResult')
     .addItem('🔍 Diagnose Scan Limit', 'diagnose')
     .addItem('📏 Probe Bytes Per Table', 'probeTables')
+    .addItem('📐 Probe Wide Table Columns', 'probeWideColumns')
     .addToUi();
 }
 
@@ -435,4 +436,53 @@ function probeTables() {
   sh.getRange('A1:D1').setFontWeight('bold');
   sh.setColumnWidth(1, 520).setColumnWidth(4, 400);
   ss.toast('Probe written to "Probe" sheet', 'Insurance FMS', 8);
+}
+
+// ============================================================
+//  PROBE: GB scanned per column of the wide fact table
+//  (all probes start together, then are polled, to fit the 6-min cap)
+// ============================================================
+function probeWideColumns() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = readConfig();
+  const cols = ['fleet_owner_id', 'fo_name', 'truck_no', 'truck_id', 'registration_date', 'manufacturer', 'body_type',
+    'gross_weight', 'unladen_weight', 'wheel_base', 'model', 'vehicle_class', 'vehicle_category', 'cubic_capacity',
+    'insurance_name', 'insurance_policy_number', 'insurance_expiry_date', 'financier', 'last_updated_on', 'latitude', 'longitude'];
+  const where = " where insurance_expiry_date is not null and date(from_unixtime((insurance_expiry_date + 19800000)/1000)) between date('" +
+    cfg.startDate + "') and date('" + cfg.endDate + "')";
+
+  const jobs = cols.map(c => ({
+    col: c,
+    id: athenaCall('StartQueryExecution', {
+      QueryString: 'select count(' + c + ') from fact_tables.finserv_insurance_fms_query' + where,
+      WorkGroup: WORK_GROUP, QueryExecutionContext: { Database: SCHEMA },
+      ClientRequestToken: Utilities.getUuid()
+    }).QueryExecutionId
+  }));
+
+  const deadline = Date.now() + 270 * 1000;
+  const rows = [['Column', 'State', 'GB scanned']];
+  let pending = jobs.slice(), done = [];
+  while (pending.length && Date.now() < deadline) {
+    const still = [];
+    pending.forEach(j => {
+      const qe = athenaCall('GetQueryExecution', { QueryExecutionId: j.id }).QueryExecution;
+      const st = qe.Status.State;
+      if (st === 'QUEUED' || st === 'RUNNING') { still.push(j); return; }
+      done.push([j.col, st, (((qe.Statistics || {}).DataScannedInBytes || 0) / 1073741824)]);
+    });
+    pending = still;
+    if (pending.length) Utilities.sleep(5000);
+  }
+  pending.forEach(j => done.push([j.col, 'STILL RUNNING', 0]));
+  let total = 0;
+  done.sort((a, b) => b[2] - a[2]).forEach(r => { total += r[2]; rows.push([r[0], r[1], r[2].toFixed(2)]); });
+  rows.push(['TOTAL (sum of columns)', '', total.toFixed(2)]);
+
+  let sh = ss.getSheetByName('ProbeColumns') || ss.insertSheet('ProbeColumns');
+  sh.clear();
+  sh.getRange(1, 1, rows.length, 3).setValues(rows);
+  sh.getRange('A1:C1').setFontWeight('bold');
+  sh.setColumnWidth(1, 260);
+  ss.toast('Wrote "ProbeColumns" sheet', 'Insurance FMS', 8);
 }
