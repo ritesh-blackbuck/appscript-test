@@ -9,9 +9,8 @@
  * "Bytes scanned limit was exceeded" means the workgroup's per-query data
  * limit (see WORK_GROUP) cancelled the query. Changes in this
  * version to scan less data:
- *   - Athena re-runs a CTE at every reference, so the wide base table is
- *     now read once; other tables key off a narrow `ids` CTE
- *   - the other tables are semi-joined to the surviving ids
+ *   - the wide fact table is read exactly once (Athena re-runs a CTE at
+ *     every reference); the small dimension tables are joined directly
  *   - redundant GROUP BY / DISTINCT passes removed
  *   - on failure the script reports bytes scanned, so you can see how
  *     close a narrower date range / fewer states gets you to the limit
@@ -109,21 +108,12 @@ function buildQuery(cfg) {
     : '1=1';
   const limitClause = cfg.limit > 0 ? 'limit ' + cfg.limit : '';
 
-  // NOTE: Athena re-executes a CTE at every reference, so the wide table
-  // (finserv_insurance_fms_query, ~20 columns) is read exactly once, in the
-  // final SELECT. Everything else keys off the narrow `ids` CTE.
+  // The three dimension tables are small (~1 GB combined), so they are joined
+  // directly. The wide fact table is the expensive one and is read exactly once.
   return `with
-ids as (
-  select truck_id, fleet_owner_id
-  from fact_tables.finserv_insurance_fms_query
-  where insurance_expiry_date is not null
-    and date(from_unixtime((insurance_expiry_date + 19800000)/1000)) between date('${cfg.startDate}') and date('${cfg.endDate}')
-    and ${prefixFilter}
-),
 fleet_phone as (
   select id, phone_no
   from supply_team.supply_team_blackbuck_fleetApp_fleetowner
-  where id in (select fleet_owner_id from ids)
   group by 1, 2
 ),
 tto_latest as (
@@ -138,7 +128,6 @@ tto_kyc as (
   select distinct truck_id, truck_owner_id, kyc_status
   from tto_latest
   where kyc_status in ('INSTANT_KYC_APPROVED', 'APPROVED')
-    and truck_id in (select truck_id from ids)
 ),
 documents as (
   select id,
@@ -150,10 +139,6 @@ documents as (
   from supply.supply_blackbuck_document
   where document_type in ('PAN_CARD','ADHAAR_CARD') and status = 'APPROVED' and entity_type = 'TRUCK_OWNER'
   group by id
-),
-docs_ok as (
-  select * from documents
-  where entity_id in (select truck_owner_id from tto_kyc)
 )
 select distinct
   m.fleet_owner_id, m.fo_name, m.truck_no, m.truck_id, m.registration_date, m.manufacturer, m.body_type, m.gross_weight,
@@ -174,8 +159,8 @@ from (
 ) m
 left join fleet_phone p on m.fleet_owner_id = p.id
 join tto_kyc k on m.truck_id = k.truck_id
-left join (select * from docs_ok where document_type = 'PAN_CARD') b on k.truck_owner_id = b.entity_id
-left join (select * from docs_ok where document_type = 'ADHAAR_CARD') c on k.truck_owner_id = c.entity_id
+left join (select * from documents where document_type = 'PAN_CARD') b on k.truck_owner_id = b.entity_id
+left join (select * from documents where document_type = 'ADHAAR_CARD') c on k.truck_owner_id = c.entity_id
 ${limitClause}`;
 }
 
